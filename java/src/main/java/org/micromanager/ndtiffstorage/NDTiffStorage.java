@@ -596,7 +596,7 @@ public class NDTiffStorage implements NDTiffAPI, MultiresNDTiffAPI {
    public TaggedImage getDisplayImage(HashMap<String, Object> axes,
                                       int dsIndex, int x, int y, int width, int height) {
       ensureTileAffinePositions();
-      boolean useAffine = tiled_ && !tileAffinePositions_.isEmpty() && dsIndex == 0;
+      boolean useAffine = tiled_ && !tileAffinePositions_.isEmpty();
       if (useAffine) {
          return getDisplayImageWithAffinePositions(axes, dsIndex, x, y, width, height);
       }
@@ -725,101 +725,229 @@ public class NDTiffStorage implements NDTiffAPI, MultiresNDTiffAPI {
       JSONObject topLeftMD = null;
       EssentialImageMetadata eimd = null;
 
-      // Iterate all level-N tiles whose downsampled origin intersects [x, x+width) x [y, y+height).
-      // At level N a tile has the same buffer dimensions (tileWidth_ x tileHeight_) as full-res.
-      ResolutionLevel storage = dsIndex == 0
-            ? fullResStorage_
-            : lowResStorages_.get(dsIndex);
-      if (storage == null) {
+      if (dsIndex == 0) {
+         // Level 0: iterate full-res tiles, place each at its affine canvas position.
+         // Buffer pixel (0,0) = canvas (tx, ty); buffer is fullResTileWidthIncludingOverlap_ wide.
+         for (String levelKey : fullResStorage_.imageKeys()) {
+            HashMap<String, Object> tileAxes = IndexEntryData.deserializeAxes(levelKey);
+            if (!matchesNonSpatialAxes(axes, tileAxes)) {
+               continue;
+            }
+            Point origin = getAffineBoundsAtLevel(tileAxes, 0);
+            if (origin == null) {
+               continue;
+            }
+            int tileX0 = origin.x;
+            int tileY0 = origin.y;
+            int tileX1 = tileX0 + fullResTileWidthIncludingOverlap_;
+            int tileY1 = tileY0 + fullResTileHeightIncludingOverlap_;
+            if (tileX1 <= x || tileX0 >= x + width || tileY1 <= y || tileY0 >= y + height) {
+               continue;
+            }
+            TaggedImage tile = fullResStorage_.getImage(levelKey);
+            if (tile == null || tile.pix == null || isEmptyPix(tile.pix)) {
+               continue;
+            }
+            if (topLeftMD == null) {
+               topLeftMD = tile.tags;
+            }
+            if (eimd == null) {
+               eimd = getEssentialImageMetadata(tileAxes, 0);
+               if (eimd == null) {
+                  continue;
+               }
+               pixels = allocatePixels(pixels, width, height, eimd, tile);
+            }
+            int multiplier = eimd.rgb ? 4 : 1;
+            int storedW = fullResTileWidthIncludingOverlap_;
+            int intX0 = Math.max(tileX0, x);
+            int intY0 = Math.max(tileY0, y);
+            int intX1 = Math.min(tileX1, x + width);
+            int intY1 = Math.min(tileY1, y + height);
+            for (int row = intY0; row < intY1; row++) {
+               int srcIdx = multiplier * ((row - tileY0) * storedW + (intX0 - tileX0));
+               int dstIdx = multiplier * ((row - y) * width + (intX0 - x));
+               int copyLen = Math.min(multiplier * (intX1 - intX0),
+                     multiplier * (storedW - (intX0 - tileX0)));
+               try {
+                  System.arraycopy(tile.pix, srcIdx, pixels, dstIdx, copyLen);
+               } catch (Exception e) {
+                  e.printStackTrace();
+                  throw new RuntimeException("Problem copying pixels at level 0");
+               }
+            }
+         }
+         return new TaggedImage(pixels, topLeftMD);
+      }
+
+      // Level N >= 1: the level-N buffer packs dsScale×dsScale full-res tiles into quadrants.
+      // Each full-res tile at (fullRow, fullCol) occupies quadrant
+      //   (xPos = fullCol % dsScale, yPos = fullRow % dsScale)
+      // inside its level-N tile at (fullRow >> dsIndex, fullCol >> dsIndex).
+      // The quadrant's buffer region is:
+      //   x: [xPos * quadW, (xPos+1) * quadW)   where quadW = tileWidth_ / dsScale
+      //   y: [yPos * quadH, (yPos+1) * quadH)   where quadH = tileHeight_ / dsScale
+      // The downsample code (resolutionIndex==1) reads from level-0 buffer at
+      //   pixelX = x + xOverlap_/2,  where x iterates 0..tileWidth_-1 step 2
+      // so buffer pixel (bx, by) at level N >= 1 corresponds to full-res content pixel
+      //   (bx*2 + xOverlap_/2 at level 1, etc.) — but for placement purposes:
+      // The quadrant's canvas position = (tx + xOverlap_/2) / dsScale for the contributing
+      // full-res tile, where tx is the TileAffineTransform origin.
+      //
+      // Strategy: iterate full-res tiles (which have affine positions), compute which
+      // level-N tile they contribute to, fetch that level-N tile's buffer, and blit the
+      // quadrant region mapping canvas coords to buffer offsets.
+
+      int dsScale = 1 << dsIndex;
+      int quadW = tileWidth_ / dsScale;   // width of one quadrant in the level-N buffer
+      int quadH = tileHeight_ / dsScale;
+
+      ResolutionLevel dsStorage = lowResStorages_.get(dsIndex);
+      if (dsStorage == null) {
          return new TaggedImage(null, null);
       }
 
-      for (String levelKey : storage.imageKeys()) {
-         HashMap<String, Object> tileAxes = IndexEntryData.deserializeAxes(levelKey);
-         // Filter by non-spatial axes.
-         boolean matches = true;
-         for (Map.Entry<String, Object> e : axes.entrySet()) {
-            String k = e.getKey();
-            if (k.equals(ROW_AXIS) || k.equals(COL_AXIS)) {
-               continue;
-            }
-            if (!e.getValue().equals(tileAxes.get(k))) {
-               matches = false;
-               break;
-            }
+      for (HashMap<String, Object> fullResAxes : imageAxes_) {
+         if (!matchesNonSpatialAxes(axes, fullResAxes)) {
+            continue;
          }
-         if (!matches) {
+         Object rowObj = fullResAxes.get(ROW_AXIS);
+         Object colObj = fullResAxes.get(COL_AXIS);
+         if (!(rowObj instanceof Integer) || !(colObj instanceof Integer)) {
+            continue;
+         }
+         int fullRow = (Integer) rowObj;
+         int fullCol = (Integer) colObj;
+
+         // Canvas position of this full-res tile's content at level N.
+         String fullKey = IndexEntryData.serializeAxes(fullResAxes);
+         Point fullPos = tileAffinePositions_.get(fullKey);
+         if (fullPos == null) {
+            continue;
+         }
+         // Quadrant buffer pixel 0 = full-res content pixel 0 = canvas (tx + xOverlap_/2)/dsScale.
+         int canvasX0 = (fullPos.x + xOverlap_ / 2) / dsScale;
+         int canvasY0 = (fullPos.y + yOverlap_ / 2) / dsScale;
+         int canvasX1 = canvasX0 + quadW;
+         int canvasY1 = canvasY0 + quadH;
+
+         // Skip if this region doesn't intersect the viewport.
+         if (canvasX1 <= x || canvasX0 >= x + width || canvasY1 <= y || canvasY0 >= y + height) {
             continue;
          }
 
-         // Get this tile's canvas position (only used at dsIndex==0).
-         Point origin = getAffineBoundsAtLevel(tileAxes, dsIndex);
-         if (origin == null) {
-            continue;
-         }
-         int tileX0 = origin.x;
-         int tileY0 = origin.y;
-         int tileX1 = tileX0 + fullResTileWidthIncludingOverlap_;
-         int tileY1 = tileY0 + fullResTileHeightIncludingOverlap_;
+         // Fetch the level-N tile that contains this full-res tile's quadrant.
+         int levelRow = Math.floorDiv(fullRow, dsScale);
+         int levelCol = Math.floorDiv(fullCol, dsScale);
+         int xPos = Math.floorMod(fullCol, dsScale);
+         int yPos = Math.floorMod(fullRow, dsScale);
 
-         // Skip tiles outside the viewport.
-         if (tileX1 <= x || tileX0 >= x + width || tileY1 <= y || tileY0 >= y + height) {
-            continue;
-         }
+         HashMap<String, Object> levelAxes = new HashMap<>(fullResAxes);
+         levelAxes.put(ROW_AXIS, levelRow);
+         levelAxes.put(COL_AXIS, levelCol);
+         String levelKey = IndexEntryData.serializeAxes(levelAxes);
 
-         TaggedImage tile = storage.getImage(levelKey);
-         if (tile == null || tile.pix == null
-               || (tile.pix instanceof byte[] && ((byte[]) tile.pix).length == 0)
-               || (tile.pix instanceof short[] && ((short[]) tile.pix).length == 0)) {
+         TaggedImage tile = dsStorage.getImage(levelKey);
+         if (tile == null || tile.pix == null || isEmptyPix(tile.pix)) {
             continue;
          }
          if (topLeftMD == null) {
             topLeftMD = tile.tags;
          }
-
          if (eimd == null) {
-            eimd = getEssentialImageMetadata(tileAxes, dsIndex);
+            eimd = getEssentialImageMetadata(levelAxes, dsIndex);
             if (eimd == null) {
                continue;
             }
-            if (pixels == null) {
-               if (eimd.rgb) {
-                  pixels = new byte[width * height * 4];
-               } else if (tile.pix instanceof byte[]) {
-                  pixels = new byte[width * height];
-               } else {
-                  pixels = new short[width * height];
-               }
-            }
+            pixels = allocatePixels(pixels, width, height, eimd, tile);
          }
 
          int multiplier = eimd.rgb ? 4 : 1;
+         // The quadrant for this full-res tile starts at (bufQX0, bufQY0) in the level-N buffer.
+         int bufQX0 = xPos * quadW;
+         int bufQY0 = yPos * quadH;
 
-         // At level 0: buffer is fullResTileWidthIncludingOverlap_ wide.
-         // TileAffineTransform records the canvas position of buffer pixel (0,0).
-         int storedW = fullResTileWidthIncludingOverlap_;
-
-         int intX0 = Math.max(tileX0, x);
-         int intY0 = Math.max(tileY0, y);
-         int intX1 = Math.min(tileX1, x + width);
-         int intY1 = Math.min(tileY1, y + height);
+         // Intersection of this tile's canvas region with the viewport.
+         int intX0 = Math.max(canvasX0, x);
+         int intY0 = Math.max(canvasY0, y);
+         int intX1 = Math.min(canvasX1, x + width);
+         int intY1 = Math.min(canvasY1, y + height);
 
          for (int row = intY0; row < intY1; row++) {
-            int tileYPix = row - tileY0;
-            int tileXPix = intX0 - tileX0;
-            int srcIdx = multiplier * (tileYPix * storedW + tileXPix);
-            int dstIdx = multiplier * ((row - y) * width + (intX0 - x));
-            int copyLen = Math.min(multiplier * (intX1 - intX0),
-                  multiplier * (storedW - tileXPix));
-            try {
-               System.arraycopy(tile.pix, srcIdx, pixels, dstIdx, copyLen);
-            } catch (Exception e) {
-               e.printStackTrace();
-               throw new RuntimeException("Problem copying pixels");
+            int bufY = bufQY0 + (row - canvasY0);
+            if (bufY < bufQY0) bufY = bufQY0;
+            else if (bufY >= bufQY0 + quadH) bufY = bufQY0 + quadH - 1;
+            if (bufY < 0 || bufY >= tileHeight_) continue;
+
+            // Main copy: in-bounds canvas pixels map 1:1 to buffer pixels.
+            int clampedIntX0 = Math.max(intX0, canvasX0);
+            int clampedIntX1 = Math.min(intX1, canvasX1);
+            if (clampedIntX1 > clampedIntX0) {
+               int bufX = bufQX0 + (clampedIntX0 - canvasX0);
+               int srcIdx = multiplier * (bufY * tileWidth_ + bufX);
+               int dstIdx = multiplier * ((row - y) * width + (clampedIntX0 - x));
+               int copyLen = multiplier * (clampedIntX1 - clampedIntX0);
+               try {
+                  System.arraycopy(tile.pix, srcIdx, pixels, dstIdx, copyLen);
+               } catch (Exception e) {
+                  e.printStackTrace();
+                  throw new RuntimeException("Problem copying pixels at level " + dsIndex);
+               }
+            }
+            // Edge pixel: write canvas pixel canvasX1 using the last buffer pixel.
+            // Covers 1-pixel rounding gaps from integer division in canvasX0/canvasX1.
+            if (canvasX1 >= x && canvasX1 < x + width) {
+               int edgeBufX = bufQX0 + quadW - 1;
+               int edgeSrcIdx = multiplier * (bufY * tileWidth_ + edgeBufX);
+               int edgeDstIdx = multiplier * ((row - y) * width + (canvasX1 - x));
+               try {
+                  System.arraycopy(tile.pix, edgeSrcIdx, pixels, edgeDstIdx, multiplier);
+               } catch (Exception e) {
+                  e.printStackTrace();
+                  throw new RuntimeException("Problem edge-pixel at level " + dsIndex);
+               }
             }
          }
       }
       return new TaggedImage(pixels, topLeftMD);
+   }
+
+   private boolean matchesNonSpatialAxes(HashMap<String, Object> requested,
+                                          HashMap<String, Object> candidate) {
+      for (Map.Entry<String, Object> e : requested.entrySet()) {
+         String k = e.getKey();
+         if (k.equals(ROW_AXIS) || k.equals(COL_AXIS)) {
+            continue;
+         }
+         if (!e.getValue().equals(candidate.get(k))) {
+            return false;
+         }
+      }
+      return true;
+   }
+
+   private boolean isEmptyPix(Object pix) {
+      if (pix instanceof byte[]) {
+         return ((byte[]) pix).length == 0;
+      }
+      if (pix instanceof short[]) {
+         return ((short[]) pix).length == 0;
+      }
+      return false;
+   }
+
+   private Object allocatePixels(Object existing, int width, int height,
+                                  EssentialImageMetadata eimd, TaggedImage tile) {
+      if (existing != null) {
+         return existing;
+      }
+      if (eimd.rgb) {
+         return new byte[width * height * 4];
+      } else if (tile.pix instanceof byte[]) {
+         return new byte[width * height];
+      } else {
+         return new short[width * height];
+      }
    }
 
    /**
