@@ -27,9 +27,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
@@ -104,6 +107,19 @@ public class NDTiffStorage implements NDTiffAPI, MultiresNDTiffAPI {
    private final HashMap<String, Class> axisTypes_ = new HashMap<>();
 
    private boolean firstImageAdded_ = false;
+
+   // Per-tile affine position cache, built lazily from level-0 tags.
+   // Key = serialized full axes (row+col+non-spatial). Value = full-res (tx, ty) from affine.
+   // null = not yet built. Empty = no affine tags present (use uniform grid).
+   private volatile Map<String, Point> tileAffinePositions_ = null;
+   // Per-level position maps derived from tileAffinePositions_.
+   // Key = resolution level. Value = map of serialized level-N axes -> downsampled canvas origin.
+   private final Map<Integer, Map<String, Point>> levelPositions_ = new TreeMap<>();
+   private final Object affinePositionLock_ = new Object();
+
+   /** Tag name for the per-tile 3D affine transform (row-major 3x4 JSON array). */
+   public static final String TILE_AFFINE_TAG = "TileAffineTransform";
+
    private static final int BUFFER_DIRECT_THRESHOLD = 8192;
    private static final int BUFFER_RECYCLE_SIZE_MIN = 1024;
    private static final int BUFFER_POOL_SIZE =
@@ -454,6 +470,83 @@ public class NDTiffStorage implements NDTiffAPI, MultiresNDTiffAPI {
       return 1 + maxCol - minCol;
    }
 
+   /**
+    * Builds the per-tile affine position cache from level-0 tile tags (run once, synchronized).
+    * Reads TileAffineTransform (3x4 row-major array) or falls back to XPositionPix/YPositionPix.
+    * If any tile lacks both, sets an empty map so the uniform-grid path is used.
+    */
+   private void ensureTileAffinePositions() {
+      if (tileAffinePositions_ != null) {
+         return;
+      }
+      synchronized (affinePositionLock_) {
+         if (tileAffinePositions_ != null) {
+            return;
+         }
+         if (!tiled_ || imageAxes_.isEmpty()) {
+            tileAffinePositions_ = new HashMap<>();
+            return;
+         }
+         Map<String, Point> positions = new HashMap<>();
+         for (HashMap<String, Object> axes : imageAxes_) {
+            String key = IndexEntryData.serializeAxes(axes);
+            TaggedImage ti = fullResStorage_.getImage(key);
+            if (ti == null || ti.tags == null) {
+               positions = new HashMap<>();
+               break;
+            }
+            int tx;
+            int ty;
+            mmcorej.org.json.JSONArray affineArr = ti.tags.optJSONArray(TILE_AFFINE_TAG);
+            if (affineArr != null && affineArr.length() == 12) {
+               tx = (int) Math.round(affineArr.optDouble(3, Double.NaN));
+               ty = (int) Math.round(affineArr.optDouble(7, Double.NaN));
+               if (Double.isNaN(affineArr.optDouble(3, Double.NaN))) {
+                  positions = new HashMap<>();
+                  break;
+               }
+            } else {
+               int xp = ti.tags.optInt("XPositionPix", Integer.MIN_VALUE);
+               int yp = ti.tags.optInt("YPositionPix", Integer.MIN_VALUE);
+               if (xp == Integer.MIN_VALUE || yp == Integer.MIN_VALUE) {
+                  positions = new HashMap<>();
+                  break;
+               }
+               tx = xp;
+               ty = yp;
+            }
+            positions.put(key, new Point(tx, ty));
+         }
+         tileAffinePositions_ = positions;
+      }
+   }
+
+   /**
+    * Returns the canvas origin (in level-dsIndex pixel coords) for the tile identified
+    * by axesCopy (which must include ROW_AXIS and COL_AXIS).
+    * Only valid when tileAffinePositions_ is non-empty.
+    */
+   private Point getAffineBoundsAtLevel(HashMap<String, Object> axesCopy, int dsIndex) {
+      synchronized (affinePositionLock_) {
+         Map<String, Point> levelMap = levelPositions_.get(dsIndex);
+         if (levelMap == null) {
+            levelMap = buildLevelPositionMap(dsIndex);
+            levelPositions_.put(dsIndex, levelMap);
+         }
+         String key = IndexEntryData.serializeAxes(axesCopy);
+         return levelMap.get(key);
+      }
+   }
+
+   /** Builds the level-N canvas origin map from the full-res position map. */
+   private Map<String, Point> buildLevelPositionMap(int dsIndex) {
+      Map<String, Point> levelMap = new HashMap<>();
+      for (Map.Entry<String, Point> e : tileAffinePositions_.entrySet()) {
+         levelMap.put(e.getKey(), e.getValue());
+      }
+      return levelMap;
+   }
+
    /*
     * It does not matter what resolution level the pixel is at since tiles
     * are the same size at every level.
@@ -502,7 +595,20 @@ public class NDTiffStorage implements NDTiffAPI, MultiresNDTiffAPI {
     */
    public TaggedImage getDisplayImage(HashMap<String, Object> axes,
                                       int dsIndex, int x, int y, int width, int height) {
+      ensureTileAffinePositions();
+      boolean useAffine = tiled_ && !tileAffinePositions_.isEmpty() && dsIndex == 0;
+      if (useAffine) {
+         return getDisplayImageWithAffinePositions(axes, dsIndex, x, y, width, height);
+      }
+      return getDisplayImageUniformGrid(axes, dsIndex, x, y, width, height);
+   }
 
+   /**
+    * Original uniform-grid implementation of getDisplayImage (unchanged behaviour).
+    */
+   private TaggedImage getDisplayImageUniformGrid(HashMap<String, Object> axes,
+                                                   int dsIndex, int x, int y,
+                                                   int width, int height) {
       // Figure out what type of pixels
       Object pixels = null;
       //go line by line through one column of tiles at a time, then move to next column
@@ -535,13 +641,14 @@ public class NDTiffStorage implements NDTiffAPI, MultiresNDTiffAPI {
       //get starting row and column
       long rowStart = tileIndexFromPixelIndex(y, false);
       long colStart = tileIndexFromPixelIndex(x, true);
-      //xOffset and y offset are the distance from the top left of the display image into which 
+      //xOffset and y offset are the distance from the top left of the display image into which
       //we are copying data
       int xOffset = 0;
       for (long col = colStart; col < colStart + lineWidths.size(); col++) {
          int yOffset = 0;
          for (long row = rowStart; row < rowStart + lineHeights.size(); row++) {
-            HashMap<String, Object> axesCopy = IndexEntryData.deserializeAxes(IndexEntryData.serializeAxes(axes));
+            HashMap<String, Object> axesCopy = IndexEntryData.deserializeAxes(
+                  IndexEntryData.serializeAxes(axes));
             //Add in axes for row and col because this is how tiles are stored
             if (tiled_) {
                axesCopy.put(ROW_AXIS, (int) row);
@@ -549,26 +656,20 @@ public class NDTiffStorage implements NDTiffAPI, MultiresNDTiffAPI {
             }
             TaggedImage tile = getImage(axesCopy, dsIndex);
             if (tile == null) {
-               yOffset += lineHeights.get((int) (row - rowStart)); //increment y offset so new tiles appear in correct position
-               continue; //If no data present for this tile go on to next one
+               yOffset += lineHeights.get((int) (row - rowStart));
+               continue;
             } else if ((tile.pix instanceof byte[] && ((byte[]) tile.pix).length == 0)
                     || (tile.pix instanceof short[] && ((short[]) tile.pix).length == 0)) {
-               //Somtimes an inability to read IFDs soon after they are written results in an image being read 
-               //with 0 length pixels. Can't figure out why this happens, but it is rare and will result at worst with
-               //a black flickering during acquisition
-               yOffset += lineHeights.get((int) (row - rowStart)); //increment y offset so new tiles appear in correct position
+               yOffset += lineHeights.get((int) (row - rowStart));
                continue;
             }
-            //take top left tile for metadata
             if (topLeftMD == null) {
                topLeftMD = tile.tags;
             }
-            //Copy pixels into the image to be returned
-            //yOffset is how many rows from top of viewable area, y is top of image to top of area
-            for (int line = yOffset; line < lineHeights.get((int) (row - rowStart)) + yOffset; line++) {
+            for (int line = yOffset; line < lineHeights.get((int) (row - rowStart)) + yOffset;
+                  line++) {
                int tileYPix = (int) ((y + line) % tileHeight_);
                int tileXPix = (int) ((x + xOffset) % tileWidth_);
-               //make sure tile pixels are positive
                while (tileXPix < 0) {
                   tileXPix += tileWidth_;
                }
@@ -586,10 +687,8 @@ public class NDTiffStorage implements NDTiffAPI, MultiresNDTiffAPI {
                         pixels = new short[width * height];
                      }
                   }
-
                   int multiplier = eimd.rgb ? 4 : 1;
                   if (dsIndex == 0) {
-                     //account for overlaps when viewing full resolution tiles
                      tileYPix += yOverlap_ / 2;
                      tileXPix += xOverlap_ / 2;
                      System.arraycopy(tile.pix, multiplier * (tileYPix
@@ -607,9 +706,118 @@ public class NDTiffStorage implements NDTiffAPI, MultiresNDTiffAPI {
                }
             }
             yOffset += lineHeights.get((int) (row - rowStart));
-
          }
          xOffset += lineWidths.get((int) (col - colStart));
+      }
+      return new TaggedImage(pixels, topLeftMD);
+   }
+
+   /**
+    * Position-aware implementation of getDisplayImage.
+    * Uses per-tile TileAffineTransform / XPositionPix origins instead of the uniform grid.
+    * Iterates all tiles whose affine origin overlaps the requested viewport rectangle.
+    */
+   private TaggedImage getDisplayImageWithAffinePositions(HashMap<String, Object> axes,
+                                                           int dsIndex,
+                                                           int x, int y,
+                                                           int width, int height) {
+      Object pixels = null;
+      JSONObject topLeftMD = null;
+      EssentialImageMetadata eimd = null;
+
+      // Iterate all level-N tiles whose downsampled origin intersects [x, x+width) x [y, y+height).
+      // At level N a tile has the same buffer dimensions (tileWidth_ x tileHeight_) as full-res.
+      ResolutionLevel storage = dsIndex == 0
+            ? fullResStorage_
+            : lowResStorages_.get(dsIndex);
+      if (storage == null) {
+         return new TaggedImage(null, null);
+      }
+
+      for (String levelKey : storage.imageKeys()) {
+         HashMap<String, Object> tileAxes = IndexEntryData.deserializeAxes(levelKey);
+         // Filter by non-spatial axes.
+         boolean matches = true;
+         for (Map.Entry<String, Object> e : axes.entrySet()) {
+            String k = e.getKey();
+            if (k.equals(ROW_AXIS) || k.equals(COL_AXIS)) {
+               continue;
+            }
+            if (!e.getValue().equals(tileAxes.get(k))) {
+               matches = false;
+               break;
+            }
+         }
+         if (!matches) {
+            continue;
+         }
+
+         // Get this tile's canvas position (only used at dsIndex==0).
+         Point origin = getAffineBoundsAtLevel(tileAxes, dsIndex);
+         if (origin == null) {
+            continue;
+         }
+         int tileX0 = origin.x;
+         int tileY0 = origin.y;
+         int tileX1 = tileX0 + fullResTileWidthIncludingOverlap_;
+         int tileY1 = tileY0 + fullResTileHeightIncludingOverlap_;
+
+         // Skip tiles outside the viewport.
+         if (tileX1 <= x || tileX0 >= x + width || tileY1 <= y || tileY0 >= y + height) {
+            continue;
+         }
+
+         TaggedImage tile = storage.getImage(levelKey);
+         if (tile == null || tile.pix == null
+               || (tile.pix instanceof byte[] && ((byte[]) tile.pix).length == 0)
+               || (tile.pix instanceof short[] && ((short[]) tile.pix).length == 0)) {
+            continue;
+         }
+         if (topLeftMD == null) {
+            topLeftMD = tile.tags;
+         }
+
+         if (eimd == null) {
+            eimd = getEssentialImageMetadata(tileAxes, dsIndex);
+            if (eimd == null) {
+               continue;
+            }
+            if (pixels == null) {
+               if (eimd.rgb) {
+                  pixels = new byte[width * height * 4];
+               } else if (tile.pix instanceof byte[]) {
+                  pixels = new byte[width * height];
+               } else {
+                  pixels = new short[width * height];
+               }
+            }
+         }
+
+         int multiplier = eimd.rgb ? 4 : 1;
+
+         // At level 0: buffer is fullResTileWidthIncludingOverlap_ wide.
+         // TileAffineTransform records the canvas position of buffer pixel (0,0).
+         int storedW = fullResTileWidthIncludingOverlap_;
+
+         int intX0 = Math.max(tileX0, x);
+         int intY0 = Math.max(tileY0, y);
+         int intX1 = Math.min(tileX1, x + width);
+         int intY1 = Math.min(tileY1, y + height);
+
+         for (int row = intY0; row < intY1; row++) {
+            int tileYPix = row - tileY0;
+            int tileXPix = intX0 - tileX0;
+            int srcIdx = multiplier * (tileYPix * storedW + tileXPix);
+            int dstIdx = multiplier * ((row - y) * width + (intX0 - x));
+            int copyLen = Math.min(multiplier * (intX1 - intX0),
+                  multiplier * (storedW - tileXPix));
+            try {
+               System.arraycopy(tile.pix, srcIdx, pixels, dstIdx, copyLen);
+            } catch (Exception e) {
+               e.printStackTrace();
+               throw new RuntimeException("Problem copying pixels");
+            }
+         }
       }
       return new TaggedImage(pixels, topLeftMD);
    }
